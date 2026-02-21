@@ -130,12 +130,18 @@ def get_options(ticker: str, expiration: str = None):
         if not current_price:
             raise HTTPException(status_code=400, detail="Could not determine current price")
 
-        # Build params for Market Data App
-        params = {"side": "all"}
+         # Build params for Market Data App
+        params = {
+            "side": "all",
+            "token": MD_KEY
+        }
         if expiration:
             params["expiration"] = expiration
 
-        data = md_get(f"/options/chain/{t}/", params=params)
+        r = requests.get(f"{MD_BASE}/options/chain/{t}/", params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        print(f"Market Data response for {t}: status={data.get('s')}, keys={list(data.keys())}")
 
         if data.get("s") == "error":
             raise HTTPException(status_code=404, detail=data.get("errmsg", "No options data available"))
