@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
 import pandas as pd
 import math
+import requests
 
 app = FastAPI(title="Stock & Options Screener API")
 
@@ -25,7 +26,11 @@ def safe_float(val):
 @app.get("/stock/{ticker}")
 def get_stock(ticker: str):
     try:
-        stock = yf.Ticker(ticker.upper())
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+})
+        stock = yf.Ticker(ticker.upper(), session=session)
         info = stock.info
         hist = stock.history(period="1y")
 
@@ -82,7 +87,11 @@ def get_stock(ticker: str):
 @app.get("/options/{ticker}")
 def get_options(ticker: str, expiration: str = None):
     try:
-        stock = yf.Ticker(ticker.upper())
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+})
+        stock = yf.Ticker(ticker.upper(), session=session)
         expirations = stock.options
 
         if not expirations:
