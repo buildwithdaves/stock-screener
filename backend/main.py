@@ -44,8 +44,24 @@ def get_stock(ticker: str):
                 "volume": int(row["Volume"]) if pd.notna(row["Volume"]) else None
             })
 
-        current_price = safe_float(info.get("currentPrice") or info.get("regularMarketPrice") or hist["Close"].iloc[-1])
+        current_price = safe_float(
+    info.get("currentPrice") or 
+    info.get("regularMarketPrice") or 
+    info.get("navPrice") or
+    (hist["Close"].iloc[-1] if not hist.empty else None)
+)
 
+if not current_price:
+    raise HTTPException(status_code=404, detail="Could not retrieve price data")
+```
+
+Also update the `requirements.txt` to use the latest yfinance:
+```
+fastapi==0.111.0
+uvicorn==0.30.1
+yfinance==0.2.44
+pandas==2.2.2
+numpy<2.0
         return {
             "ticker": ticker.upper(),
             "name": info.get("longName", ticker.upper()),
