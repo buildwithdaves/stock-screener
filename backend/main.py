@@ -1,9 +1,8 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import yfinance as yf
-import pandas as pd
 import math
 import requests
+from datetime import datetime, timedelta
 
 app = FastAPI(title="Stock & Options Screener API")
 
@@ -14,19 +13,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+YF_BASE = "https://query1.finance.yahoo.com"
+YF_BASE2 = "https://query2.finance.yahoo.com"
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://finance.yahoo.com",
+    "Referer": "https://finance.yahoo.com",
 }
-
-
-def get_session():
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    return session
 
 
 def safe_float(val):
@@ -37,65 +33,96 @@ def safe_float(val):
         return None
 
 
-def get_ticker(symbol):
-    session = get_session()
-    return yf.Ticker(symbol.upper(), session=session)
+def yf_get(path, params=None, use_base2=False):
+    base = YF_BASE2 if use_base2 else YF_BASE
+    url = f"{base}{path}"
+    try:
+        r = requests.get(url, headers=HEADERS, params=params, timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except requests.HTTPError:
+        alt = YF_BASE if use_base2 else YF_BASE2
+        r = requests.get(f"{alt}{path}", headers=HEADERS, params=params, timeout=15)
+        r.raise_for_status()
+        return r.json()
 
 
 @app.get("/stock/{ticker}")
 def get_stock(ticker: str):
+    t = ticker.upper().strip()
     try:
-        stock = get_ticker(ticker)
-        hist = stock.history(period="1y")
+        data = yf_get("/v10/finance/quoteSummary/" + t, params={
+            "modules": "price,summaryDetail,defaultKeyStatistics,assetProfile"
+        })
 
-        if hist.empty:
-            raise HTTPException(status_code=404, detail="Ticker not found or no data available")
+        result = data.get("quoteSummary", {}).get("result")
+        if not result:
+            raise HTTPException(status_code=404, detail="Ticker not found")
 
-        try:
-            info = stock.info
-        except Exception:
-            info = {}
+        price = result[0].get("price", {})
+        summary = result[0].get("summaryDetail", {})
+        stats = result[0].get("defaultKeyStatistics", {})
+        profile = result[0].get("assetProfile", {})
 
-        price_data = []
-        for date, row in hist.iterrows():
-            price_data.append({
-                "date": date.strftime("%Y-%m-%d"),
-                "open": safe_float(row["Open"]),
-                "high": safe_float(row["High"]),
-                "low": safe_float(row["Low"]),
-                "close": safe_float(row["Close"]),
-                "volume": int(row["Volume"]) if pd.notna(row["Volume"]) else None
-            })
+        current_price = safe_float(price.get("regularMarketPrice", {}).get("raw"))
+        if not current_price:
+            raise HTTPException(status_code=404, detail="Could not retrieve price data")
 
-        current_price = (
-            safe_float(info.get("currentPrice")) or
-            safe_float(info.get("regularMarketPrice")) or
-            safe_float(info.get("navPrice")) or
-            safe_float(hist["Close"].iloc[-1])
-        )
+        end = int(datetime.now().timestamp())
+        start = int((datetime.now() - timedelta(days=365)).timestamp())
+        hist_data = yf_get("/v8/finance/chart/" + t, params={
+            "period1": start,
+            "period2": end,
+            "interval": "1d"
+        })
+
+        price_history = []
+        chart = hist_data.get("chart", {}).get("result", [{}])[0]
+        timestamps = chart.get("timestamp", [])
+        closes = chart.get("indicators", {}).get("quote", [{}])[0].get("close", [])
+        opens = chart.get("indicators", {}).get("quote", [{}])[0].get("open", [])
+        highs = chart.get("indicators", {}).get("quote", [{}])[0].get("high", [])
+        lows = chart.get("indicators", {}).get("quote", [{}])[0].get("low", [])
+        volumes = chart.get("indicators", {}).get("quote", [{}])[0].get("volume", [])
+
+        for i, ts in enumerate(timestamps):
+            try:
+                price_history.append({
+                    "date": datetime.fromtimestamp(ts).strftime("%Y-%m-%d"),
+                    "open": safe_float(opens[i]) if i < len(opens) else None,
+                    "high": safe_float(highs[i]) if i < len(highs) else None,
+                    "low": safe_float(lows[i]) if i < len(lows) else None,
+                    "close": safe_float(closes[i]) if i < len(closes) else None,
+                    "volume": int(volumes[i]) if i < len(volumes) and volumes[i] else None,
+                })
+            except:
+                continue
+
+        def raw(d, key):
+            return safe_float(d.get(key, {}).get("raw")) if isinstance(d.get(key), dict) else safe_float(d.get(key))
 
         return {
-            "ticker": ticker.upper(),
-            "name": info.get("longName") or info.get("shortName") or ticker.upper(),
+            "ticker": t,
+            "name": price.get("longName") or price.get("shortName") or t,
             "current_price": current_price,
-            "previous_close": safe_float(info.get("previousClose") or info.get("regularMarketPreviousClose")),
-            "open": safe_float(info.get("open") or info.get("regularMarketOpen")),
-            "day_high": safe_float(info.get("dayHigh") or info.get("regularMarketDayHigh")),
-            "day_low": safe_float(info.get("dayLow") or info.get("regularMarketDayLow")),
-            "week_52_high": safe_float(info.get("fiftyTwoWeekHigh")),
-            "week_52_low": safe_float(info.get("fiftyTwoWeekLow")),
-            "market_cap": info.get("marketCap"),
-            "pe_ratio": safe_float(info.get("trailingPE")),
-            "forward_pe": safe_float(info.get("forwardPE")),
-            "eps": safe_float(info.get("trailingEps")),
-            "dividend_yield": safe_float(info.get("dividendYield")),
-            "beta": safe_float(info.get("beta")),
-            "volume": info.get("volume") or info.get("regularMarketVolume"),
-            "avg_volume": info.get("averageVolume"),
-            "sector": info.get("sector"),
-            "industry": info.get("industry"),
-            "description": (info.get("longBusinessSummary") or "")[:500],
-            "price_history": price_data
+            "previous_close": raw(price, "regularMarketPreviousClose"),
+            "open": raw(price, "regularMarketOpen"),
+            "day_high": raw(price, "regularMarketDayHigh"),
+            "day_low": raw(price, "regularMarketDayLow"),
+            "week_52_high": raw(summary, "fiftyTwoWeekHigh"),
+            "week_52_low": raw(summary, "fiftyTwoWeekLow"),
+            "market_cap": raw(price, "marketCap"),
+            "pe_ratio": raw(summary, "trailingPE"),
+            "forward_pe": raw(summary, "forwardPE"),
+            "eps": raw(stats, "trailingEps"),
+            "dividend_yield": raw(summary, "dividendYield"),
+            "beta": raw(summary, "beta"),
+            "volume": raw(price, "regularMarketVolume"),
+            "avg_volume": raw(summary, "averageVolume"),
+            "sector": profile.get("sector"),
+            "industry": profile.get("industry"),
+            "description": (profile.get("longBusinessSummary") or "")[:500],
+            "price_history": price_history
         }
     except HTTPException:
         raise
@@ -105,47 +132,43 @@ def get_stock(ticker: str):
 
 @app.get("/options/{ticker}")
 def get_options(ticker: str, expiration: str = None):
+    t = ticker.upper().strip()
     try:
-        stock = get_ticker(ticker)
+        params = {"getAllData": "true"}
+        if expiration:
+            try:
+                params["date"] = int(datetime.strptime(expiration, "%Y-%m-%d").timestamp())
+            except:
+                pass
 
-        try:
-            expirations = stock.options
-        except Exception:
-            expirations = []
+        data = yf_get(f"/v7/finance/options/{t}", params=params)
 
-        if not expirations:
-            raise HTTPException(status_code=404, detail="No options data available for this ticker")
+        result = data.get("optionChain", {}).get("result")
+        if not result:
+            raise HTTPException(status_code=404, detail="No options data available")
 
-        hist = stock.history(period="2d")
-        try:
-            info = stock.info
-        except Exception:
-            info = {}
-
-        current_price = (
-            safe_float(info.get("currentPrice")) or
-            safe_float(info.get("regularMarketPrice")) or
-            safe_float(hist["Close"].iloc[-1] if not hist.empty else None)
-        )
-
+        chain_data = result[0]
+        current_price = safe_float(chain_data.get("quote", {}).get("regularMarketPrice"))
         if not current_price:
             raise HTTPException(status_code=400, detail="Could not determine current price")
 
-        selected_exp = expiration if expiration in expirations else expirations[0]
+        exp_timestamps = chain_data.get("expirationDates", [])
+        expirations = [datetime.fromtimestamp(ts).strftime("%Y-%m-%d") for ts in exp_timestamps]
 
-        try:
-            chain = stock.option_chain(selected_exp)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Could not fetch options chain: {str(e)}")
+        options = chain_data.get("options", [{}])[0]
+        calls_raw = options.get("calls", [])
+        puts_raw = options.get("puts", [])
 
-        def process_chain(df, option_type):
+        selected_exp = expiration if expiration in expirations else (expirations[0] if expirations else "")
+
+        def process_chain(raw_options, option_type):
             results = []
-            for _, row in df.iterrows():
+            for opt in raw_options:
                 try:
-                    strike = safe_float(row.get("strike"))
-                    bid = safe_float(row.get("bid"))
-                    ask = safe_float(row.get("ask"))
-                    last = safe_float(row.get("lastPrice"))
+                    strike = safe_float(opt.get("strike"))
+                    bid = safe_float(opt.get("bid"))
+                    ask = safe_float(opt.get("ask"))
+                    last = safe_float(opt.get("lastPrice"))
                     mid_premium = round((bid + ask) / 2, 4) if (bid and ask) else (last or 0)
 
                     if not strike or not mid_premium:
@@ -181,16 +204,19 @@ def get_options(ticker: str, expiration: str = None):
                             "profitable": pnl_per_share > 0
                         }
 
-                    iv = safe_float(row.get("impliedVolatility"))
-                    volume = int(row["volume"]) if pd.notna(row.get("volume")) else 0
-                    open_interest = int(row["openInterest"]) if pd.notna(row.get("openInterest")) else 0
+                    iv = safe_float(opt.get("impliedVolatility"))
+                    volume = int(opt.get("volume", 0) or 0)
+                    open_interest = int(opt.get("openInterest", 0) or 0)
                     unusual_volume = volume > (open_interest * 0.5) if open_interest > 0 and volume > 100 else False
 
+                    exp_ts = opt.get("expiration")
+                    exp_str = datetime.fromtimestamp(exp_ts).strftime("%Y-%m-%d") if exp_ts else selected_exp
+
                     results.append({
-                        "contract_name": row.get("contractSymbol", ""),
+                        "contract_name": opt.get("contractSymbol", ""),
                         "type": option_type,
                         "strike": strike,
-                        "expiration": selected_exp,
+                        "expiration": exp_str,
                         "bid": bid,
                         "ask": ask,
                         "last_price": last,
@@ -199,7 +225,7 @@ def get_options(ticker: str, expiration: str = None):
                         "volume": volume,
                         "open_interest": open_interest,
                         "implied_volatility": round(iv * 100, 2) if iv else None,
-                        "in_the_money": bool(row.get("inTheMoney", False)),
+                        "in_the_money": bool(opt.get("inTheMoney", False)),
                         "breakeven": breakeven,
                         "pct_to_breakeven": pct_to_breakeven,
                         "unusual_volume": unusual_volume,
@@ -209,16 +235,13 @@ def get_options(ticker: str, expiration: str = None):
                     continue
             return results
 
-        calls = process_chain(chain.calls, "call")
-        puts = process_chain(chain.puts, "put")
-
         return {
-            "ticker": ticker.upper(),
+            "ticker": t,
             "current_price": current_price,
-            "expirations": list(expirations),
+            "expirations": expirations,
             "selected_expiration": selected_exp,
-            "calls": calls,
-            "puts": puts
+            "calls": process_chain(calls_raw, "call"),
+            "puts": process_chain(puts_raw, "put")
         }
     except HTTPException:
         raise
