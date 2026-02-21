@@ -14,6 +14,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+}
+
+
+def get_session():
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    return session
+
 
 def safe_float(val):
     try:
@@ -23,19 +37,24 @@ def safe_float(val):
         return None
 
 
+def get_ticker(symbol):
+    session = get_session()
+    return yf.Ticker(symbol.upper(), session=session)
+
+
 @app.get("/stock/{ticker}")
 def get_stock(ticker: str):
     try:
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-})
-        stock = yf.Ticker(ticker.upper(), session=session)
-        info = stock.info
+        stock = get_ticker(ticker)
         hist = stock.history(period="1y")
 
         if hist.empty:
-            raise HTTPException(status_code=404, detail="Ticker not found")
+            raise HTTPException(status_code=404, detail="Ticker not found or no data available")
+
+        try:
+            info = stock.info
+        except Exception:
+            info = {}
 
         price_data = []
         for date, row in hist.iterrows():
@@ -48,21 +67,21 @@ def get_stock(ticker: str):
                 "volume": int(row["Volume"]) if pd.notna(row["Volume"]) else None
             })
 
-        current_price = safe_float(
-            info.get("currentPrice") or
-            info.get("regularMarketPrice") or
-            info.get("navPrice") or
-            (hist["Close"].iloc[-1] if not hist.empty else None)
+        current_price = (
+            safe_float(info.get("currentPrice")) or
+            safe_float(info.get("regularMarketPrice")) or
+            safe_float(info.get("navPrice")) or
+            safe_float(hist["Close"].iloc[-1])
         )
 
         return {
             "ticker": ticker.upper(),
-            "name": info.get("longName", ticker.upper()),
+            "name": info.get("longName") or info.get("shortName") or ticker.upper(),
             "current_price": current_price,
-            "previous_close": safe_float(info.get("previousClose")),
-            "open": safe_float(info.get("open")),
-            "day_high": safe_float(info.get("dayHigh")),
-            "day_low": safe_float(info.get("dayLow")),
+            "previous_close": safe_float(info.get("previousClose") or info.get("regularMarketPreviousClose")),
+            "open": safe_float(info.get("open") or info.get("regularMarketOpen")),
+            "day_high": safe_float(info.get("dayHigh") or info.get("regularMarketDayHigh")),
+            "day_low": safe_float(info.get("dayLow") or info.get("regularMarketDayLow")),
             "week_52_high": safe_float(info.get("fiftyTwoWeekHigh")),
             "week_52_low": safe_float(info.get("fiftyTwoWeekLow")),
             "market_cap": info.get("marketCap"),
@@ -71,11 +90,11 @@ def get_stock(ticker: str):
             "eps": safe_float(info.get("trailingEps")),
             "dividend_yield": safe_float(info.get("dividendYield")),
             "beta": safe_float(info.get("beta")),
-            "volume": info.get("volume"),
+            "volume": info.get("volume") or info.get("regularMarketVolume"),
             "avg_volume": info.get("averageVolume"),
             "sector": info.get("sector"),
             "industry": info.get("industry"),
-            "description": info.get("longBusinessSummary", "")[:500],
+            "description": (info.get("longBusinessSummary") or "")[:500],
             "price_history": price_data
         }
     except HTTPException:
@@ -87,92 +106,107 @@ def get_stock(ticker: str):
 @app.get("/options/{ticker}")
 def get_options(ticker: str, expiration: str = None):
     try:
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-})
-        stock = yf.Ticker(ticker.upper(), session=session)
-        expirations = stock.options
+        stock = get_ticker(ticker)
+
+        try:
+            expirations = stock.options
+        except Exception:
+            expirations = []
 
         if not expirations:
-            raise HTTPException(status_code=404, detail="No options data available")
+            raise HTTPException(status_code=404, detail="No options data available for this ticker")
 
-        info = stock.info
-        current_price = safe_float(
-            info.get("currentPrice") or
-            info.get("regularMarketPrice") or
-            stock.history(period="1d")["Close"].iloc[-1]
+        hist = stock.history(period="2d")
+        try:
+            info = stock.info
+        except Exception:
+            info = {}
+
+        current_price = (
+            safe_float(info.get("currentPrice")) or
+            safe_float(info.get("regularMarketPrice")) or
+            safe_float(hist["Close"].iloc[-1] if not hist.empty else None)
         )
 
+        if not current_price:
+            raise HTTPException(status_code=400, detail="Could not determine current price")
+
         selected_exp = expiration if expiration in expirations else expirations[0]
-        chain = stock.option_chain(selected_exp)
+
+        try:
+            chain = stock.option_chain(selected_exp)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Could not fetch options chain: {str(e)}")
 
         def process_chain(df, option_type):
             results = []
             for _, row in df.iterrows():
-                strike = safe_float(row.get("strike"))
-                premium = safe_float(row.get("lastPrice")) or safe_float(row.get("ask")) or 0
-                bid = safe_float(row.get("bid"))
-                ask = safe_float(row.get("ask"))
-                mid_premium = round((bid + ask) / 2, 4) if bid and ask else premium
+                try:
+                    strike = safe_float(row.get("strike"))
+                    bid = safe_float(row.get("bid"))
+                    ask = safe_float(row.get("ask"))
+                    last = safe_float(row.get("lastPrice"))
+                    mid_premium = round((bid + ask) / 2, 4) if (bid and ask) else (last or 0)
 
-                if not strike or not current_price:
-                    continue
+                    if not strike or not mid_premium:
+                        continue
 
-                if option_type == "call":
-                    breakeven = round(strike + mid_premium, 2)
-                    pct_to_breakeven = round(((breakeven - current_price) / current_price) * 100, 2)
-                else:
-                    breakeven = round(strike - mid_premium, 2)
-                    pct_to_breakeven = round(((current_price - breakeven) / current_price) * 100, 2)
-
-                scenarios = {}
-                multipliers = {
-                    "-50%": -0.50, "-25%": -0.25, "-10%": -0.10,
-                    "+10%": 0.10, "+25%": 0.25, "+50%": 0.50,
-                    "+75%": 0.75, "+100%": 1.00
-                }
-                for label, pct in multipliers.items():
-                    scenario_price = current_price * (1 + pct)
                     if option_type == "call":
-                        intrinsic = max(0, scenario_price - strike)
+                        breakeven = round(strike + mid_premium, 2)
+                        pct_to_breakeven = round(((breakeven - current_price) / current_price) * 100, 2)
                     else:
-                        intrinsic = max(0, strike - scenario_price)
-                    pnl_per_share = round(intrinsic - mid_premium, 2)
-                    pnl_per_contract = round(pnl_per_share * 100, 2)
-                    pct_return = round((pnl_per_share / mid_premium) * 100, 1) if mid_premium > 0 else None
-                    scenarios[label] = {
-                        "scenario_price": round(scenario_price, 2),
-                        "pnl_per_share": pnl_per_share,
-                        "pnl_per_contract": pnl_per_contract,
-                        "pct_return": pct_return,
-                        "profitable": pnl_per_share > 0
+                        breakeven = round(strike - mid_premium, 2)
+                        pct_to_breakeven = round(((current_price - breakeven) / current_price) * 100, 2)
+
+                    scenarios = {}
+                    multipliers = {
+                        "-50%": -0.50, "-25%": -0.25, "-10%": -0.10,
+                        "+10%": 0.10, "+25%": 0.25, "+50%": 0.50,
+                        "+75%": 0.75, "+100%": 1.00
                     }
+                    for label, pct in multipliers.items():
+                        scenario_price = current_price * (1 + pct)
+                        if option_type == "call":
+                            intrinsic = max(0, scenario_price - strike)
+                        else:
+                            intrinsic = max(0, strike - scenario_price)
+                        pnl_per_share = round(intrinsic - mid_premium, 2)
+                        pnl_per_contract = round(pnl_per_share * 100, 2)
+                        pct_return = round((pnl_per_share / mid_premium) * 100, 1) if mid_premium > 0 else None
+                        scenarios[label] = {
+                            "scenario_price": round(scenario_price, 2),
+                            "pnl_per_share": pnl_per_share,
+                            "pnl_per_contract": pnl_per_contract,
+                            "pct_return": pct_return,
+                            "profitable": pnl_per_share > 0
+                        }
 
-                iv = safe_float(row.get("impliedVolatility"))
-                volume = int(row["volume"]) if pd.notna(row.get("volume")) else 0
-                open_interest = int(row["openInterest"]) if pd.notna(row.get("openInterest")) else 0
-                unusual_volume = volume > (open_interest * 0.5) if open_interest > 0 and volume > 100 else False
+                    iv = safe_float(row.get("impliedVolatility"))
+                    volume = int(row["volume"]) if pd.notna(row.get("volume")) else 0
+                    open_interest = int(row["openInterest"]) if pd.notna(row.get("openInterest")) else 0
+                    unusual_volume = volume > (open_interest * 0.5) if open_interest > 0 and volume > 100 else False
 
-                results.append({
-                    "contract_name": row.get("contractSymbol", ""),
-                    "type": option_type,
-                    "strike": strike,
-                    "expiration": selected_exp,
-                    "bid": bid,
-                    "ask": ask,
-                    "last_price": premium,
-                    "mid_premium": mid_premium,
-                    "cost_per_contract": round(mid_premium * 100, 2),
-                    "volume": volume,
-                    "open_interest": open_interest,
-                    "implied_volatility": round(iv * 100, 2) if iv else None,
-                    "in_the_money": bool(row.get("inTheMoney", False)),
-                    "breakeven": breakeven,
-                    "pct_to_breakeven": pct_to_breakeven,
-                    "unusual_volume": unusual_volume,
-                    "scenarios": scenarios
-                })
+                    results.append({
+                        "contract_name": row.get("contractSymbol", ""),
+                        "type": option_type,
+                        "strike": strike,
+                        "expiration": selected_exp,
+                        "bid": bid,
+                        "ask": ask,
+                        "last_price": last,
+                        "mid_premium": mid_premium,
+                        "cost_per_contract": round(mid_premium * 100, 2),
+                        "volume": volume,
+                        "open_interest": open_interest,
+                        "implied_volatility": round(iv * 100, 2) if iv else None,
+                        "in_the_money": bool(row.get("inTheMoney", False)),
+                        "breakeven": breakeven,
+                        "pct_to_breakeven": pct_to_breakeven,
+                        "unusual_volume": unusual_volume,
+                        "scenarios": scenarios
+                    })
+                except Exception:
+                    continue
             return results
 
         calls = process_chain(chain.calls, "call")
