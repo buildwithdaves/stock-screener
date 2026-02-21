@@ -1,7 +1,0 @@
-node_modules/
-build/
-.env
-.env.local
-__pycache__/
-*.pyc
-.DS_Store
