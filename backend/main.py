@@ -15,15 +15,9 @@ app.add_middleware(
 )
 
 AV_KEY = os.environ.get("ALPHA_VANTAGE_KEY")
+MD_KEY = os.environ.get("MARKET_DATA_KEY")
 AV_BASE = "https://www.alphavantage.co/query"
-
-YF_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Origin": "https://finance.yahoo.com",
-    "Referer": "https://finance.yahoo.com",
-}
+MD_BASE = "https://api.marketdata.app/v1"
 
 
 def safe_float(val):
@@ -41,12 +35,9 @@ def av_get(params):
     return r.json()
 
 
-def yf_get(path, params=None):
-    url = f"https://query1.finance.yahoo.com{path}"
-    r = requests.get(url, headers=YF_HEADERS, params=params, timeout=15)
-    if r.status_code != 200:
-        url = f"https://query2.finance.yahoo.com{path}"
-        r = requests.get(url, headers=YF_HEADERS, params=params, timeout=15)
+def md_get(path, params=None):
+    headers = {"Authorization": f"Token {MD_KEY}"}
+    r = requests.get(f"{MD_BASE}{path}", headers=headers, params=params, timeout=15)
     r.raise_for_status()
     return r.json()
 
@@ -55,7 +46,6 @@ def yf_get(path, params=None):
 def get_stock(ticker: str):
     t = ticker.upper().strip()
     try:
-        # Get quote from Alpha Vantage
         quote_data = av_get({"function": "GLOBAL_QUOTE", "symbol": t})
         quote = quote_data.get("Global Quote", {})
 
@@ -69,7 +59,6 @@ def get_stock(ticker: str):
         day_low = safe_float(quote.get("04. low"))
         volume = safe_float(quote.get("06. volume"))
 
-        # Get company overview from Alpha Vantage
         overview_data = av_get({"function": "OVERVIEW", "symbol": t})
 
         name = overview_data.get("Name") or t
@@ -86,7 +75,6 @@ def get_stock(ticker: str):
         dividend_yield = safe_float(overview_data.get("DividendYield"))
         avg_volume = safe_float(overview_data.get("10DayAverageTradingVolume"))
 
-        # Get 1Y daily price history
         hist_data = av_get({"function": "TIME_SERIES_DAILY", "symbol": t, "outputsize": "compact"})
         time_series = hist_data.get("Time Series (Daily)", {})
 
@@ -134,114 +122,129 @@ def get_stock(ticker: str):
 def get_options(ticker: str, expiration: str = None):
     t = ticker.upper().strip()
     try:
-        params = {"getAllData": "true"}
-        if expiration:
-            try:
-                params["date"] = int(datetime.strptime(expiration, "%Y-%m-%d").timestamp())
-            except:
-                pass
+        # Get current price from Alpha Vantage
+        quote_data = av_get({"function": "GLOBAL_QUOTE", "symbol": t})
+        quote = quote_data.get("Global Quote", {})
+        current_price = safe_float(quote.get("05. price"))
 
-        data = yf_get(f"/v7/finance/options/{t}", params=params)
-
-        result = data.get("optionChain", {}).get("result")
-        if not result:
-            raise HTTPException(status_code=404, detail="No options data available")
-
-        chain_data = result[0]
-        current_price = safe_float(chain_data.get("quote", {}).get("regularMarketPrice"))
         if not current_price:
             raise HTTPException(status_code=400, detail="Could not determine current price")
 
-        exp_timestamps = chain_data.get("expirationDates", [])
-        expirations = [datetime.fromtimestamp(ts).strftime("%Y-%m-%d") for ts in exp_timestamps]
+        # Build params for Market Data App
+        params = {"side": "all"}
+        if expiration:
+            params["expiration"] = expiration
 
-        options = chain_data.get("options", [{}])[0]
-        calls_raw = options.get("calls", [])
-        puts_raw = options.get("puts", [])
+        data = md_get(f"/options/chain/{t}/", params=params)
 
-        selected_exp = expiration if expiration in expirations else (expirations[0] if expirations else "")
+        if data.get("s") == "error":
+            raise HTTPException(status_code=404, detail=data.get("errmsg", "No options data available"))
 
-        def process_chain(raw_options, option_type):
-            results = []
-            for opt in raw_options:
-                try:
-                    strike = safe_float(opt.get("strike"))
-                    bid = safe_float(opt.get("bid"))
-                    ask = safe_float(opt.get("ask"))
-                    last = safe_float(opt.get("lastPrice"))
-                    mid_premium = round((bid + ask) / 2, 4) if (bid and ask) else (last or 0)
+        if data.get("s") != "ok" or not data.get("optionSymbol"):
+            raise HTTPException(status_code=404, detail="No options data available")
 
-                    if not strike or not mid_premium:
-                        continue
+        # Extract all expirations
+        all_expirations = sorted(set(data.get("expiration", [])))
 
-                    if option_type == "call":
-                        breakeven = round(strike + mid_premium, 2)
-                        pct_to_breakeven = round(((breakeven - current_price) / current_price) * 100, 2)
-                    else:
-                        breakeven = round(strike - mid_premium, 2)
-                        pct_to_breakeven = round(((current_price - breakeven) / current_price) * 100, 2)
+        # Group options by type
+        calls = []
+        puts = []
 
-                    scenarios = {}
-                    multipliers = {
-                        "-50%": -0.50, "-25%": -0.25, "-10%": -0.10,
-                        "+10%": 0.10, "+25%": 0.25, "+50%": 0.50,
-                        "+75%": 0.75, "+100%": 1.00
-                    }
-                    for label, pct in multipliers.items():
-                        scenario_price = current_price * (1 + pct)
-                        if option_type == "call":
-                            intrinsic = max(0, scenario_price - strike)
-                        else:
-                            intrinsic = max(0, strike - scenario_price)
-                        pnl_per_share = round(intrinsic - mid_premium, 2)
-                        pnl_per_contract = round(pnl_per_share * 100, 2)
-                        pct_return = round((pnl_per_share / mid_premium) * 100, 1) if mid_premium > 0 else None
-                        scenarios[label] = {
-                            "scenario_price": round(scenario_price, 2),
-                            "pnl_per_share": pnl_per_share,
-                            "pnl_per_contract": pnl_per_contract,
-                            "pct_return": pct_return,
-                            "profitable": pnl_per_share > 0
-                        }
+        selected_exp = expiration or (all_expirations[0] if all_expirations else None)
 
-                    iv = safe_float(opt.get("impliedVolatility"))
-                    volume = int(opt.get("volume", 0) or 0)
-                    open_interest = int(opt.get("openInterest", 0) or 0)
-                    unusual_volume = volume > (open_interest * 0.5) if open_interest > 0 and volume > 100 else False
+        for i, symbol in enumerate(data.get("optionSymbol", [])):
+            try:
+                opt_type = data.get("side", [])[i]
+                exp = data.get("expiration", [])[i]
 
-                    exp_ts = opt.get("expiration")
-                    exp_str = datetime.fromtimestamp(exp_ts).strftime("%Y-%m-%d") if exp_ts else selected_exp
-
-                    results.append({
-                        "contract_name": opt.get("contractSymbol", ""),
-                        "type": option_type,
-                        "strike": strike,
-                        "expiration": exp_str,
-                        "bid": bid,
-                        "ask": ask,
-                        "last_price": last,
-                        "mid_premium": mid_premium,
-                        "cost_per_contract": round(mid_premium * 100, 2),
-                        "volume": volume,
-                        "open_interest": open_interest,
-                        "implied_volatility": round(iv * 100, 2) if iv else None,
-                        "in_the_money": bool(opt.get("inTheMoney", False)),
-                        "breakeven": breakeven,
-                        "pct_to_breakeven": pct_to_breakeven,
-                        "unusual_volume": unusual_volume,
-                        "scenarios": scenarios
-                    })
-                except Exception:
+                # Filter by expiration if selected
+                if selected_exp and exp != selected_exp:
                     continue
-            return results
+
+                strike = safe_float(data.get("strike", [])[i])
+                bid = safe_float(data.get("bid", [])[i])
+                ask = safe_float(data.get("ask", [])[i])
+                last = safe_float(data.get("last", [])[i])
+                mid_premium = round((bid + ask) / 2, 4) if (bid and ask) else (last or 0)
+
+                if not strike or not mid_premium:
+                    continue
+
+                if opt_type == "call":
+                    breakeven = round(strike + mid_premium, 2)
+                    pct_to_breakeven = round(((breakeven - current_price) / current_price) * 100, 2)
+                else:
+                    breakeven = round(strike - mid_premium, 2)
+                    pct_to_breakeven = round(((current_price - breakeven) / current_price) * 100, 2)
+
+                in_the_money = (
+                    (opt_type == "call" and current_price > strike) or
+                    (opt_type == "put" and current_price < strike)
+                )
+
+                scenarios = {}
+                multipliers = {
+                    "-50%": -0.50, "-25%": -0.25, "-10%": -0.10,
+                    "+10%": 0.10, "+25%": 0.25, "+50%": 0.50,
+                    "+75%": 0.75, "+100%": 1.00
+                }
+                for label, pct in multipliers.items():
+                    scenario_price = current_price * (1 + pct)
+                    if opt_type == "call":
+                        intrinsic = max(0, scenario_price - strike)
+                    else:
+                        intrinsic = max(0, strike - scenario_price)
+                    pnl_per_share = round(intrinsic - mid_premium, 2)
+                    pnl_per_contract = round(pnl_per_share * 100, 2)
+                    pct_return = round((pnl_per_share / mid_premium) * 100, 1) if mid_premium > 0 else None
+                    scenarios[label] = {
+                        "scenario_price": round(scenario_price, 2),
+                        "pnl_per_share": pnl_per_share,
+                        "pnl_per_contract": pnl_per_contract,
+                        "pct_return": pct_return,
+                        "profitable": pnl_per_share > 0
+                    }
+
+                iv = safe_float(data.get("iv", [])[i]) if i < len(data.get("iv", [])) else None
+                volume = int(data.get("volume", [])[i] or 0) if i < len(data.get("volume", [])) else 0
+                open_interest = int(data.get("openInterest", [])[i] or 0) if i < len(data.get("openInterest", [])) else 0
+                unusual_volume = volume > (open_interest * 0.5) if open_interest > 0 and volume > 100 else False
+
+                option = {
+                    "contract_name": symbol,
+                    "type": opt_type,
+                    "strike": strike,
+                    "expiration": exp,
+                    "bid": bid,
+                    "ask": ask,
+                    "last_price": last,
+                    "mid_premium": mid_premium,
+                    "cost_per_contract": round(mid_premium * 100, 2),
+                    "volume": volume,
+                    "open_interest": open_interest,
+                    "implied_volatility": round(iv * 100, 2) if iv else None,
+                    "in_the_money": in_the_money,
+                    "breakeven": breakeven,
+                    "pct_to_breakeven": pct_to_breakeven,
+                    "unusual_volume": unusual_volume,
+                    "scenarios": scenarios
+                }
+
+                if opt_type == "call":
+                    calls.append(option)
+                else:
+                    puts.append(option)
+
+            except Exception:
+                continue
 
         return {
             "ticker": t,
             "current_price": current_price,
-            "expirations": expirations,
+            "expirations": all_expirations,
             "selected_expiration": selected_exp,
-            "calls": process_chain(calls_raw, "call"),
-            "puts": process_chain(puts_raw, "put")
+            "calls": sorted(calls, key=lambda x: x["strike"]),
+            "puts": sorted(puts, key=lambda x: x["strike"])
         }
     except HTTPException:
         raise
