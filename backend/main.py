@@ -2,7 +2,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
 import pandas as pd
-from datetime import datetime
 import math
 
 app = FastAPI(title="Stock & Options Screener API")
@@ -45,14 +44,12 @@ def get_stock(ticker: str):
             })
 
         current_price = safe_float(
-    info.get("currentPrice") or 
-    info.get("regularMarketPrice") or 
-    info.get("navPrice") or
-    (hist["Close"].iloc[-1] if not hist.empty else None)
-)
+            info.get("currentPrice") or
+            info.get("regularMarketPrice") or
+            info.get("navPrice") or
+            (hist["Close"].iloc[-1] if not hist.empty else None)
+        )
 
-if not current_price:
-    raise HTTPException(status_code=404, detail="Could not retrieve price data")
         return {
             "ticker": ticker.upper(),
             "name": info.get("longName", ticker.upper()),
