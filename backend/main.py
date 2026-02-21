@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import math
 import requests
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 
 app = FastAPI(title="Stock & Options Screener API")
 
@@ -35,11 +35,9 @@ def av_get(params):
     return r.json()
 
 
-def md_get(path, params=None):
-    headers = {"Authorization": f"Token {MD_KEY}"}
-    r = requests.get(f"{MD_BASE}{path}", headers=headers, params=params, timeout=15)
-    r.raise_for_status()
-    return r.json()
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
 @app.get("/stock/{ticker}")
@@ -60,7 +58,6 @@ def get_stock(ticker: str):
         volume = safe_float(quote.get("06. volume"))
 
         overview_data = av_get({"function": "OVERVIEW", "symbol": t})
-
         name = overview_data.get("Name") or t
         sector = overview_data.get("Sector")
         industry = overview_data.get("Industry")
@@ -122,7 +119,7 @@ def get_stock(ticker: str):
 def get_options(ticker: str, expiration: str = None):
     t = ticker.upper().strip()
     try:
-        # Get current price from Alpha Vantage
+        # Get current price
         quote_data = av_get({"function": "GLOBAL_QUOTE", "symbol": t})
         quote = quote_data.get("Global Quote", {})
         current_price = safe_float(quote.get("05. price"))
@@ -130,40 +127,33 @@ def get_options(ticker: str, expiration: str = None):
         if not current_price:
             raise HTTPException(status_code=400, detail="Could not determine current price")
 
-         # Build params for Market Data App
-        params = {
-            "side": "all",
-            "token": MD_KEY
-        }
+        # Fetch options from Market Data App
+        params = {"side": "all", "token": MD_KEY}
         if expiration:
             params["expiration"] = expiration
 
         r = requests.get(f"{MD_BASE}/options/chain/{t}/", params=params, timeout=15)
-        r.raise_for_status()
         data = r.json()
-        print(f"Market Data response for {t}: status={data.get('s')}, keys={list(data.keys())}")
+
+        print(f"MD response: s={data.get('s')} keys={list(data.keys())}")
 
         if data.get("s") == "error":
-            raise HTTPException(status_code=404, detail=data.get("errmsg", "No options data available"))
+            raise HTTPException(status_code=404, detail=data.get("errmsg", "No options data"))
 
-        if data.get("s") != "ok" or not data.get("optionSymbol"):
+        if data.get("s") != "ok":
             raise HTTPException(status_code=404, detail="No options data available")
 
-        # Extract all expirations
         all_expirations = sorted(set(data.get("expiration", [])))
+        selected_exp = expiration or (all_expirations[0] if all_expirations else None)
 
-        # Group options by type
         calls = []
         puts = []
-
-        selected_exp = expiration or (all_expirations[0] if all_expirations else None)
 
         for i, symbol in enumerate(data.get("optionSymbol", [])):
             try:
                 opt_type = data.get("side", [])[i]
                 exp = data.get("expiration", [])[i]
 
-                # Filter by expiration if selected
                 if selected_exp and exp != selected_exp:
                     continue
 
@@ -196,10 +186,7 @@ def get_options(ticker: str, expiration: str = None):
                 }
                 for label, pct in multipliers.items():
                     scenario_price = current_price * (1 + pct)
-                    if opt_type == "call":
-                        intrinsic = max(0, scenario_price - strike)
-                    else:
-                        intrinsic = max(0, strike - scenario_price)
+                    intrinsic = max(0, scenario_price - strike) if opt_type == "call" else max(0, strike - scenario_price)
                     pnl_per_share = round(intrinsic - mid_premium, 2)
                     pnl_per_contract = round(pnl_per_share * 100, 2)
                     pct_return = round((pnl_per_share / mid_premium) * 100, 1) if mid_premium > 0 else None
@@ -211,9 +198,13 @@ def get_options(ticker: str, expiration: str = None):
                         "profitable": pnl_per_share > 0
                     }
 
-                iv = safe_float(data.get("iv", [])[i]) if i < len(data.get("iv", [])) else None
-                volume = int(data.get("volume", [])[i] or 0) if i < len(data.get("volume", [])) else 0
-                open_interest = int(data.get("openInterest", [])[i] or 0) if i < len(data.get("openInterest", [])) else 0
+                iv_list = data.get("iv", [])
+                vol_list = data.get("volume", [])
+                oi_list = data.get("openInterest", [])
+
+                iv = safe_float(iv_list[i]) if i < len(iv_list) else None
+                volume = int(vol_list[i] or 0) if i < len(vol_list) else 0
+                open_interest = int(oi_list[i] or 0) if i < len(oi_list) else 0
                 unusual_volume = volume > (open_interest * 0.5) if open_interest > 0 and volume > 100 else False
 
                 option = {
@@ -256,8 +247,3 @@ def get_options(ticker: str, expiration: str = None):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
