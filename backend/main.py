@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import math
 import requests
+import os
 from datetime import datetime, timedelta
 
 app = FastAPI(title="Stock & Options Screener API")
@@ -13,10 +14,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-YF_BASE = "https://query1.finance.yahoo.com"
-YF_BASE2 = "https://query2.finance.yahoo.com"
+AV_KEY = os.environ.get("ALPHA_VANTAGE_KEY")
+AV_BASE = "https://www.alphavantage.co/query"
 
-HEADERS = {
+YF_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
@@ -33,95 +34,94 @@ def safe_float(val):
         return None
 
 
-def yf_get(path, params=None, use_base2=False):
-    base = YF_BASE2 if use_base2 else YF_BASE
-    url = f"{base}{path}"
-    try:
-        r = requests.get(url, headers=HEADERS, params=params, timeout=15)
-        r.raise_for_status()
-        return r.json()
-    except requests.HTTPError:
-        alt = YF_BASE if use_base2 else YF_BASE2
-        r = requests.get(f"{alt}{path}", headers=HEADERS, params=params, timeout=15)
-        r.raise_for_status()
-        return r.json()
+def av_get(params):
+    params["apikey"] = AV_KEY
+    r = requests.get(AV_BASE, params=params, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+
+def yf_get(path, params=None):
+    url = f"https://query1.finance.yahoo.com{path}"
+    r = requests.get(url, headers=YF_HEADERS, params=params, timeout=15)
+    if r.status_code != 200:
+        url = f"https://query2.finance.yahoo.com{path}"
+        r = requests.get(url, headers=YF_HEADERS, params=params, timeout=15)
+    r.raise_for_status()
+    return r.json()
 
 
 @app.get("/stock/{ticker}")
 def get_stock(ticker: str):
     t = ticker.upper().strip()
     try:
-        data = yf_get("/v10/finance/quoteSummary/" + t, params={
-            "modules": "price,summaryDetail,defaultKeyStatistics,assetProfile"
-        })
+        # Get quote from Alpha Vantage
+        quote_data = av_get({"function": "GLOBAL_QUOTE", "symbol": t})
+        quote = quote_data.get("Global Quote", {})
 
-        result = data.get("quoteSummary", {}).get("result")
-        if not result:
+        if not quote or not quote.get("05. price"):
             raise HTTPException(status_code=404, detail="Ticker not found")
 
-        price = result[0].get("price", {})
-        summary = result[0].get("summaryDetail", {})
-        stats = result[0].get("defaultKeyStatistics", {})
-        profile = result[0].get("assetProfile", {})
+        current_price = safe_float(quote.get("05. price"))
+        previous_close = safe_float(quote.get("08. previous close"))
+        open_price = safe_float(quote.get("02. open"))
+        day_high = safe_float(quote.get("03. high"))
+        day_low = safe_float(quote.get("04. low"))
+        volume = safe_float(quote.get("06. volume"))
 
-        current_price = safe_float(price.get("regularMarketPrice", {}).get("raw"))
-        if not current_price:
-            raise HTTPException(status_code=404, detail="Could not retrieve price data")
+        # Get company overview from Alpha Vantage
+        overview_data = av_get({"function": "OVERVIEW", "symbol": t})
 
-        end = int(datetime.now().timestamp())
-        start = int((datetime.now() - timedelta(days=365)).timestamp())
-        hist_data = yf_get("/v8/finance/chart/" + t, params={
-            "period1": start,
-            "period2": end,
-            "interval": "1d"
-        })
+        name = overview_data.get("Name") or t
+        sector = overview_data.get("Sector")
+        industry = overview_data.get("Industry")
+        description = (overview_data.get("Description") or "")[:500]
+        market_cap = safe_float(overview_data.get("MarketCapitalization"))
+        pe_ratio = safe_float(overview_data.get("TrailingPE"))
+        forward_pe = safe_float(overview_data.get("ForwardPE"))
+        eps = safe_float(overview_data.get("EPS"))
+        beta = safe_float(overview_data.get("Beta"))
+        week_52_high = safe_float(overview_data.get("52WeekHigh"))
+        week_52_low = safe_float(overview_data.get("52WeekLow"))
+        dividend_yield = safe_float(overview_data.get("DividendYield"))
+        avg_volume = safe_float(overview_data.get("10DayAverageTradingVolume"))
+
+        # Get 1Y daily price history
+        hist_data = av_get({"function": "TIME_SERIES_DAILY", "symbol": t, "outputsize": "compact"})
+        time_series = hist_data.get("Time Series (Daily)", {})
 
         price_history = []
-        chart = hist_data.get("chart", {}).get("result", [{}])[0]
-        timestamps = chart.get("timestamp", [])
-        closes = chart.get("indicators", {}).get("quote", [{}])[0].get("close", [])
-        opens = chart.get("indicators", {}).get("quote", [{}])[0].get("open", [])
-        highs = chart.get("indicators", {}).get("quote", [{}])[0].get("high", [])
-        lows = chart.get("indicators", {}).get("quote", [{}])[0].get("low", [])
-        volumes = chart.get("indicators", {}).get("quote", [{}])[0].get("volume", [])
-
-        for i, ts in enumerate(timestamps):
-            try:
-                price_history.append({
-                    "date": datetime.fromtimestamp(ts).strftime("%Y-%m-%d"),
-                    "open": safe_float(opens[i]) if i < len(opens) else None,
-                    "high": safe_float(highs[i]) if i < len(highs) else None,
-                    "low": safe_float(lows[i]) if i < len(lows) else None,
-                    "close": safe_float(closes[i]) if i < len(closes) else None,
-                    "volume": int(volumes[i]) if i < len(volumes) and volumes[i] else None,
-                })
-            except:
-                continue
-
-        def raw(d, key):
-            return safe_float(d.get(key, {}).get("raw")) if isinstance(d.get(key), dict) else safe_float(d.get(key))
+        for date_str, values in sorted(time_series.items()):
+            price_history.append({
+                "date": date_str,
+                "open": safe_float(values.get("1. open")),
+                "high": safe_float(values.get("2. high")),
+                "low": safe_float(values.get("3. low")),
+                "close": safe_float(values.get("4. close")),
+                "volume": int(float(values.get("5. volume", 0)))
+            })
 
         return {
             "ticker": t,
-            "name": price.get("longName") or price.get("shortName") or t,
+            "name": name,
             "current_price": current_price,
-            "previous_close": raw(price, "regularMarketPreviousClose"),
-            "open": raw(price, "regularMarketOpen"),
-            "day_high": raw(price, "regularMarketDayHigh"),
-            "day_low": raw(price, "regularMarketDayLow"),
-            "week_52_high": raw(summary, "fiftyTwoWeekHigh"),
-            "week_52_low": raw(summary, "fiftyTwoWeekLow"),
-            "market_cap": raw(price, "marketCap"),
-            "pe_ratio": raw(summary, "trailingPE"),
-            "forward_pe": raw(summary, "forwardPE"),
-            "eps": raw(stats, "trailingEps"),
-            "dividend_yield": raw(summary, "dividendYield"),
-            "beta": raw(summary, "beta"),
-            "volume": raw(price, "regularMarketVolume"),
-            "avg_volume": raw(summary, "averageVolume"),
-            "sector": profile.get("sector"),
-            "industry": profile.get("industry"),
-            "description": (profile.get("longBusinessSummary") or "")[:500],
+            "previous_close": previous_close,
+            "open": open_price,
+            "day_high": day_high,
+            "day_low": day_low,
+            "week_52_high": week_52_high,
+            "week_52_low": week_52_low,
+            "market_cap": market_cap,
+            "pe_ratio": pe_ratio,
+            "forward_pe": forward_pe,
+            "eps": eps,
+            "dividend_yield": dividend_yield,
+            "beta": beta,
+            "volume": volume,
+            "avg_volume": avg_volume,
+            "sector": sector,
+            "industry": industry,
+            "description": description,
             "price_history": price_history
         }
     except HTTPException:
