@@ -119,10 +119,18 @@ def get_stock(ticker: str):
 def get_options(ticker: str, expiration: str = None):
     t = ticker.upper().strip()
     try:
-        # Get current price
-        quote_data = av_get({"function": "GLOBAL_QUOTE", "symbol": t})
-        quote = quote_data.get("Global Quote", {})
-        current_price = safe_float(quote.get("05. price"))
+        # Get current price from Market Data App to avoid AV rate limits
+        price_r = requests.get(
+            f"{MD_BASE}/stocks/quotes/{t}/",
+            params={"token": MD_KEY},
+            timeout=15
+        )
+        price_data = price_r.json()
+        print(f"Price response: {price_data}")
+        current_price = safe_float(
+            (price_data.get("last") or [None])[0] or
+            (price_data.get("mid") or [None])[0]
+        )
 
         if not current_price:
             raise HTTPException(status_code=400, detail="Could not determine current price")
